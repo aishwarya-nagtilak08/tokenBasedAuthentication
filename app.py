@@ -1,73 +1,42 @@
 from crypt import methods
-from flask import Flask, make_response, request, jsonify
-from flask_sqlalchemy import SQLAlchemy
-import uuid # for public id
+from importlib.resources import contents
+from flask import Flask, make_response, request, jsonify, session
 from  werkzeug.security import generate_password_hash, check_password_hash
-# imports for PyJWT authentication
-import jwt
 from datetime import datetime, timedelta
-from functools import wraps
+from auth import token_required
+from models import db, User, Todo
+from flask_sqlalchemy import SQLAlchemy
+import jwt
 
 app = Flask(__name__)
 
 app.config['SECRET_KEY'] = 'MySecretKey'
 app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///Database.db'
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = True
-db = SQLAlchemy(app)
 
-class User(db.Model):
-    id = db.Column(db.Integer, primary_key = True)
-    public_id = db.Column(db.String(50), unique = True)
-    name = db.Column(db.String(100))
-    email = db.Column(db.String(70), unique = True)
-    password = db.Column(db.String(80))
+db.init_app(app)
 
-def token_required(f):
-    @wraps(f)
-    def decorated(*args,**kwargs):
-        if 'x-access-token' in request.headers:
-            token = request.headers['x-access-token']
-        if not token:
-            return jsonify({'message' : 'Token is missing !!'}), 401
-  
-        try:
-            data = jwt.decode(token, app.config['SECRET_KEY'], algorithms='HS256')
-            current_user = User.query.filter_by(public_id = data['public_id']).first()
-        except Exception as e:
-            return jsonify({
-                'message' : 'Token is invalid !!'
-            }), 401
-        return  f(current_user, *args, **kwargs)
-    return decorated
 
 @app.route('/user', methods=['GET'])
 @token_required
 def user(current_user):
-    users = User.query.all()
-    output = []
-    for user in users:
-        # appending the user data json
-        # to the response list
-        output.append({
-            'public_id': user.public_id,
-            'name' : user.name,
-            'email' : user.email
-        })
-  
-    return jsonify({'users': output})
+    return jsonify({
+        "message": "successfully retrieved user profile",
+        "user_data": current_user.username
+    })
 
 @app.route('/login', methods=['GET','POST'])
 def login():
     auth = request.json
 
-    if not auth or not auth.get('email') or not auth.get('password'):
+    if not auth or not auth.get('username') or not auth.get('password'):
         return make_response(
             'Could not verify',
             401,
             {'WWW-Authenticate' : 'Basic realm ="Login required !!"'}
         )
   
-    user = User.query.filter_by(email = auth.get('email')).first()
+    user = User.query.filter_by(username = auth.get('username')).first()
 
     if not user:
         return make_response(
@@ -78,8 +47,8 @@ def login():
   
     if user.password == auth.get('password'):
         token = jwt.encode({
-            'public_id': user.public_id,
-            'exp' : datetime.utcnow() + timedelta(minutes= 30)
+            'username': user.username,
+            'exp' : datetime.utcnow() + timedelta(hours= 24)
         }, app.config['SECRET_KEY'])
 
         return make_response(jsonify({'token' : token}), 201)
@@ -94,22 +63,16 @@ def login():
 def signup():
     data = request.json
     # gets name, email and password
-    name, email = data.get('name'), data.get('email')
+    username = data.get('username')
     password = data.get('password')
   
     # checking for existing user
-    user = User.query\
-        .filter_by(email = email)\
-        .first()
+    user = User.query.filter_by(username = username).first()
     if not user:
-        # database ORM object
         user = User(
-            public_id = str(uuid.uuid4()),
-            name = name,
-            email = email,
+            username = username,
             password = password
         )
-        # insert user
         db.session.add(user)
         db.session.commit()
   
@@ -117,6 +80,78 @@ def signup():
     else:
         # returns 202 if user already exists
         return make_response('User already exists. Please Log in.', 202)
+
+
+@app.route('/insert', methods=['POST','GET'])
+@token_required
+def insert_task(current_user):
+    data = request.json
+    task_content = data.get('content')
+    user_id = current_user.id
+    new_task = Todo(content=task_content, user_id=user_id)
+    try:
+            db.session.add(new_task)
+            db.session.commit()
+            return 'Task created successfully'
+    except Exception as e:
+        return jsonify({
+            "message": "failed to create tasks",
+            "error": str(e),
+            "data": None
+        }), 500
   
+@app.route('/update/<int:id>', methods=['POST','GET'])
+@token_required
+def update_task(current_user,id):
+    task_to_update = Todo.query.get_or_404(id)
+    data = request.json
+    update_content = data.get('content')
+    task_to_update.content = update_content
+    try:
+        db.session.commit()
+        return 'Task updated successfully'
+    except:
+        return 'Task update issue'
+
+    print('update', task_to_update.content)
+    return 'hi'
+
+@app.route('/delete/<int:id>', methods=['GET'])
+@token_required
+def delete_task(current_user, id):
+        task_to_delete = Todo.query.get_or_404(id)
+        try:
+            db.session.delete(task_to_delete)
+            db.session.commit()
+            return 'Task deleted successfully'
+        except:
+            return 'Delete Exception'    
+
+@app.route("/tasks/", methods=["GET"])
+@token_required
+def get_tasks(current_user):
+    try:
+        tasks = Todo().query.filter_by(user_id=current_user.id).all()
+        # res = []
+        # for task in tasks:
+        #     res.append(task.content)
+        
+        return jsonify({
+            "message": "successfully retrieved all tasks",
+            "data": [formatTask(task) for task in tasks]
+        })
+    except Exception as e:
+        return jsonify({
+            "message": "failed to retrieve all tasks",
+            "error": str(e),
+            "data": None
+        }), 500
+
+def formatTask(task):
+    return {
+        'id': task.id,
+        'content': task.content,
+        'date_creates': task.date_creates
+    } 
 if __name__ == '__main__':
     app.run(debug=True)
